@@ -1,7 +1,6 @@
-const { scrapeTimeline } = require("../services/scraperService");
+const { scrapeTimeline, getLabsAtTime } = require("../services/scraperService");
 const { redisClient } = require("../services/redisService");
 
-// Força o horário de Brasília para extrair a data atual e a hora
 function getBrazilTimeInfos() {
   const d = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Sao_Paulo" }));
   const year = d.getFullYear();
@@ -24,38 +23,38 @@ async function getSalas(req, res) {
     const dateStr = req.query.date || bDate;
     const targetTime = req.query.time || bTime;
 
-    // v4 para consertar o bug do nome das salas em branco
-    const cacheKey = `salas_v4_${dateStr}`;
-    let timelineStr = null;
+    const cacheKey = `salas_v5_${dateStr}`; // Incrementei a versão por causa da mudança de estrutura
+    let cachedData = null;
 
     if (redisClient.isOpen) {
-      timelineStr = await redisClient.get(cacheKey);
+      cachedData = await redisClient.get(cacheKey);
     }
 
-    let timeline;
+    let data;
 
-    if (timelineStr) {
-      timeline = JSON.parse(timelineStr);
-      console.log("Servindo do Cache Redis!");
+    if (cachedData) {
+      data = JSON.parse(cachedData);
     } else {
-      console.log("Cache miss. Realizando Scraping...");
-      timeline = await scrapeTimeline(dateStr);
+      // O scraper agora retorna { timeline, allLabs }
+      data = await scrapeTimeline(dateStr);
 
-      if (redisClient.isOpen && timeline.length > 0) {
-        // Cacheia a raspagem desse dia por 5 minutos (300 segundos)
-        await redisClient.setEx(cacheKey, 300, JSON.stringify(timeline));
+      if (redisClient.isOpen && data.allLabs?.length > 0) {
+        await redisClient.setEx(cacheKey, 300, JSON.stringify(data));
       }
     }
 
-    // Procura na timeline gerada pelo bloco de tempo solicitado
-    const timeBlock = timeline.find((t) => t.time === targetTime);
+    // Em vez de dar .find(), usamos o helper que lida com horários vazios/madrugada
+    const result = getLabsAtTime(data, targetTime);
 
-    if (!timeBlock) {
-      console.log("Tempos extraídos do HTML:", timeline.map((t) => t.time));
-      return res.status(404).json({ error: "Horário não encontrado na grade desse dia.", targetTime });
+    // Se mesmo com o helper não houver labs (erro crítico de scraping), aí sim retorna erro
+    if (!result || result.labs.length === 0) {
+      return res.status(404).json({ 
+        error: "Não foi possível recuperar a lista de laboratórios.", 
+        targetTime 
+      });
     }
 
-    return res.json(timeBlock.labs);
+    return res.json(result.labs);
   } catch (error) {
     console.error("Erro no controle de salas:", error);
     res.status(500).json({ error: "Erro interno no servidor de consulta." });
