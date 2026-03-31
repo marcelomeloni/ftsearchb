@@ -14,22 +14,24 @@ async function fetchHtml(targetDate) {
 
 function parseLabsTimeline(html) {
   const $ = cheerio.load(html);
-
   const rooms = [];
-  $("thead tr")
-    .first()
-    .find("th[data-room]")
-    .each((index, el) => {
-      const $a = $(el).find("a").clone();
-      $a.find("span.capacity").remove();
-      const name = $a.text().trim() || $(el).text().trim();
-      rooms.push({ headerIndex: index, id: $(el).attr("data-room"), name });
-    });
+
+  // Captura os labs do cabeçalho primeiro (garante a lista mesmo sem horários)
+  $("thead tr").first().find("th[data-room]").each((index, el) => {
+    const $a = $(el).find("a").clone();
+    $a.find("span.capacity").remove();
+    const name = $a.text().trim() || $(el).text().trim();
+    const id = $(el).attr("data-room");
+    
+    // Filtro específico solicitado
+    if (id !== "3" && !name.includes("LP04")) {
+      rooms.push({ id, name });
+    }
+  });
 
   const timeline = [];
   const colSpans = new Array(rooms.length).fill(0);
   const bookedStatus = new Array(rooms.length).fill(false);
-  const statusMessages = new Array(rooms.length).fill("Livre");
 
   $("tbody tr").each((_, tr) => {
     const timeText = $(tr).find("th").first().text().trim();
@@ -41,97 +43,74 @@ function parseLabsTimeline(html) {
     for (let c = 0; c < rooms.length; c++) {
       if (colSpans[c] > 0) {
         colSpans[c] -= 1;
-      } else {
-        if (tdIndex < tds.length) {
-          const $td = $(tds[tdIndex]);
-          tdIndex++;
-          const rowspan = parseInt($td.attr("rowspan") || "1", 10);
-          if (rowspan > 1) colSpans[c] = rowspan - 1;
-
-          if ($td.hasClass("booked")) {
-            bookedStatus[c] = true;
-            statusMessages[c] = $td.text().trim() || "Ocupado";
-          } else {
-            bookedStatus[c] = false;
-            statusMessages[c] = "Livre";
-          }
-        }
+      } else if (tdIndex < tds.length) {
+        const $td = $(tds[tdIndex]);
+        tdIndex++;
+        const rowspan = parseInt($td.attr("rowspan") || "1", 10);
+        if (rowspan > 1) colSpans[c] = rowspan - 1;
+        bookedStatus[c] = $td.hasClass("booked");
       }
     }
 
-    const labsAtThisTime = [];
-    rooms.forEach((r, i) => {
-      if (r.id === "3" || r.name.includes("LP04")) return;
-      labsAtThisTime.push({
-        id: r.id,
-        name: r.name,
-        isFree: !bookedStatus[i],
-        statusMessage: statusMessages[i],
-      });
+    timeline.push({
+      time: timeText,
+      labs: rooms.map((r, i) => ({
+        ...r,
+        isFree: !bookedStatus[i]
+      }))
     });
-
-    timeline.push({ time: timeText, labs: labsAtThisTime });
   });
 
-  // Último horário visível na grade (ex: "22:30") — usado como fallback
-  const lastTime = timeline.length > 0 ? timeline[timeline.length - 1].time : "23:00";
+  return { 
+    timeline: processTimelineMessages(timeline),
+    allLabs: rooms 
+  };
+}
 
-  // Pós-processamento
+function processTimelineMessages(timeline) {
+  if (timeline.length === 0) return [];
+  
+  const lastTime = timeline[timeline.length - 1].time;
+
   timeline.forEach((slot, slotIndex) => {
     slot.labs.forEach((lab) => {
       if (!lab.isFree) {
-        // Busca o próximo horário em que o lab fica livre
-        let freeTime = null;
-        for (let i = slotIndex + 1; i < timeline.length; i++) {
-          const futureLab = timeline[i].labs.find((l) => l.id === lab.id);
-          if (futureLab && futureLab.isFree) {
-            freeTime = timeline[i].time;
-            break;
-          }
-        }
-        lab.statusMessage = freeTime
-          ? `Libera às ${freeTime}`
-          : "Ocupado até o fim do dia";
+        const nextFree = timeline.slice(slotIndex + 1).find(s => 
+          s.labs.find(l => l.id === lab.id && l.isFree)
+        );
+        lab.statusMessage = nextFree ? `Libera às ${nextFree.time}` : "Ocupado até o fim do dia";
       } else {
-        // Busca o próximo horário em que o lab fica ocupado
-        let busyTime = null;
-        for (let i = slotIndex + 1; i < timeline.length; i++) {
-          const futureLab = timeline[i].labs.find((l) => l.id === lab.id);
-          if (futureLab && !futureLab.isFree) {
-            busyTime = timeline[i].time;
-            break;
-          }
-        }
-        lab.statusMessage = busyTime
-          ? `Livre até ${busyTime}`
-          : `Livre até ${lastTime}`;
+        const nextBusy = timeline.slice(slotIndex + 1).find(s => 
+          s.labs.find(l => l.id === lab.id && !l.isFree)
+        );
+        lab.statusMessage = nextBusy ? `Livre até ${nextBusy.time}` : `Livre até ${lastTime}`;
       }
     });
   });
-
   return timeline;
 }
 
 /**
- * Retorna o snapshot dos labs para um horário específico (ex: "14:00").
- * Se o horário não existir na grade (fora do intervalo 08:00–22:30),
- * considera todos os labs como livres — pois o sistema só exibe das 8h às 23h.
+ * @param {Object} data Objeto retornado por parseLabsTimeline { timeline, allLabs }
+ * @param {string} timeStr Horário no formato HH:mm
  */
-function getLabsAtTime(timeline, timeStr) {
+function getLabsAtTime(data, timeStr) {
+  const { timeline, allLabs } = data;
   const slot = timeline.find((s) => s.time === timeStr);
 
   if (slot) return slot;
 
-  // Horário fora do intervalo da grade: trata todos como livres
-  const allLabIds = timeline.length > 0 ? timeline[0].labs : [];
+  const hour = parseInt(timeStr.split(":")[0], 10);
+  // Define o período de "folga" (23h até 08h)
+  const isOffHours = hour >= 23 || hour < 8;
+  
   return {
     time: timeStr,
     outOfSchedule: true,
-    labs: allLabIds.map((lab) => ({
-      id: lab.id,
-      name: lab.name,
+    labs: allLabs.map((lab) => ({
+      ...lab,
       isFree: true,
-      statusMessage: "Livre até 08:00", // antes da grade começar (ou ajuste conforme necessário)
+      statusMessage: isOffHours ? "Livre até as 08:00" : "Livre",
     })),
   };
 }
@@ -141,7 +120,4 @@ async function scrapeTimeline(dateStr) {
   return parseLabsTimeline(html);
 }
 
-module.exports = {
-  scrapeTimeline,
-  getLabsAtTime,
-};
+module.exports = { scrapeTimeline, getLabsAtTime };
